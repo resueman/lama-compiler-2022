@@ -464,6 +464,21 @@ fun toFixedNum (r) {
   singletonBuffer (Sal1 (r)) <+ Or1 (r)
 }
 
+fun cmpCall(env, name, a) {  
+  case saveRegs (liveRegisters (env, a)) of [pushRegsOnStack, popRegsFromStack] ->
+    case loadArgs (env, a) of [env, loadArgs] ->
+      case allocate (env) of [s, env] ->
+        [env, pushRegsOnStack <+>
+              loadArgs <+
+              Call (name) <+
+              Binop ("+", L (wordSize * a), esp) <+>
+              popRegsFromStack <+
+              Mov (eax, s)]
+      esac
+    esac
+  esac        
+}
+
 -- Compiles stack machine code into a list of x86 instructions. Takes an environment
 -- and stack machine code, returns an updated environment and x86 code.
 fun compile (env, code) {  
@@ -474,36 +489,173 @@ fun compile (env, code) {
 
         case i of
           READ ->
-            case env.allocate of
+            case allocate (env) of
               [s, env] -> [env, code <+ Call ("Lread") <+ Mov (eax, s)]
             esac             
         | WRITE ->
-            case env.pop of
+            case pop (env) of
               [s, env] -> [env, code <+ Push (s) <+ Call ("Lwrite") <+ Pop (eax)]
             esac
-        
-         -- Some guidelines for generating function calls:
-         --
-         -- 1. generate instructions to save live registers on the X86 stack (use
-         --    env.liveRegisters (number of arguments);
-         -- 2. generate instructions to move actual parameters from the symbolic
-         --    stack to the hardware one;
-         -- 3. generate the call itself;
-         -- 4. discard the actual parameters from the stack;
-         -- 5. restore saved live registers.
-         --
-         -- Some guidelines for generating functions:
-         --
-         -- 1. generate proper prologue for BEGIN instruction (use "prologue" helper); use
-         --    env.enterFunction to create a proper environment;
-         -- 2. generate epilogue for END instruction.
-               
+        | LD (x) ->
+            case allocate (env) of
+              [s, env] -> [env, code <+> move (env.loc (x), s)]
+            esac
+        | LDA (x) ->
+            case allocate (env) of [s1, env] -> 
+              case allocate (env) of [s2, env] -> 
+                [env, code <+ Lea (loc (env, x), eax) <+> move (eax, s2) <+> move (eax, s1)]
+              esac
+            esac
+        | ST (x) -> [env, code <+> move (env.peek, env.loc (x))]
+        | CONST (n) ->
+          case allocate (env) of
+            [s, env] -> [env, code <+> move (L (makeBox (n)), s)]
+          esac
+        | BINOP (op) ->
+            fun ([l, r, env]) { fun ([ret, env]) {[env, code <+> operation(op, l, r, ret)]}(allocate(env)) }(pop2(env))
+        | LABEL (l) ->
+            if isBarrier (env)
+            then [retrieveStack (env, l), code <+ Label (l)] 
+            else [env, code <+ Label (l)]
+            fi
+        | JMP (l) -> [setBarrier (env), code <+ Jmp (l)]
+        | CJMP (s, l) ->
+            case pop (env)of
+              [x, env] -> [setStack (env, l), code <+ Binop("cmp", L (0), x) <+ CJmp (s, l)]
+            esac
+        | STI ->
+            case pop2 (env) of
+              [v, x, env] ->
+                [push (env, v), code <+> move (v, I (0, x))]
+            esac
+        | DROP -> case env.pop of [_, env] -> [env, code] esac
+        | BEGIN (f, nA, nL) -> [env.enterFunction (f, nL), code <+> prologue (f)]
+        | END ->
+            case epilogue (env) of
+              [env, endCode] -> [env, code <+> endCode]
+            esac
+        | GLOBAL (x) -> [addGlobal (env, x), code]
+        | CALL (fLabel, nA) ->
+            case call (env, fLabel, nA) of
+              [env, callCode] -> [env, code <+> callCode]
+            esac
+        | BUILTIN (f, n) -> 
+            case cmpCall (env, "L" ++ f, n) of 
+              [env, callCode] -> [env, code <+> callCode]
+            esac
+        | STRING (s) -> 
+          case addString (env, x) of [env, xn] ->
+            case allocate (env) of [s, env] ->
+              case compileCall (env, "Bstring", 1) of [env, cCode] -> 
+                [env, code <+ Lea (M (xn), s) <+> cCode]
+              esac
+            esac
+          esac
+        | ELEM ->
+            case cmpCall (env, "Belem", 2) of 
+              [env, callCode] -> [env, code <+> callCode]
+            esac
+        | STA -> 
+            case cmpCall (env, "Bsta", 3) of 
+              [env, callCode] -> [env, code <+> callCode]
+            esac
+        | ARRAY (n) ->
+            case compileArgs (env, n) of [env, inCode, outCode] ->
+              case allocate (env) of [s, env] ->
+                [env, code <+> saveRegs () <+> inCode <+
+                      Push (L (n.makeBox)) <+ Call ("Barray") <+>
+                      outCode <+ Pop (edi) <+> restoreRegs () <+> move (eax, s)]
+              esac
+            esac
+        | SEXP (tag, a) ->
+            case addString (env, s) of [env, sn] ->
+              case compileArgs (env, n) of [env, inCode, outCode] ->
+                case allocate (env) of [s, env] ->
+                  [env, code <+> saveRegs () <+ Push (M (sn)) <+> inCode <+
+                        Push (L ((n + 1).makeBox)) <+ Call ("Bsexp") <+ Pop (edi) <+>
+                        outCode <+ Pop (edi) <+> restoreRegs () <+> move (eax, s)]
+                esac
+              esac
+            esac
         | _ -> failure ("codegeneration for instruction %s is not yet implemented\n", i.string)
         esac
       }, [env, emptyBuffer ()], code)
   }
 
   compile (env, code) 
+}
+
+fun operation(name, l, r, ret) {
+  case name of
+    "+" -> move (r, edx) <+ Binop (name, l, edx) <+ Dec (edx) <+> move (edx, ret)
+    | "-" -> move(l, eax) <+> move (r, edx) <+ Binop (name, eax, edx) <+ Or1 (edx) <+> move (edx, ret)
+    | "*" -> move (r, edx) <+ Sar1 (l) <+ Sar1 (edx) <+ Binop (name, l, edx) <+> toFixedNum (edx) <+> move (edx, ret)
+    | "/" -> move (r, eax)  <+> move (L (0), edx) <+ Sar1 (l) <+ Sar1 (eax) <+ Cltd <+ IDiv (l) <+> toFixedNum (eax) <+> move (eax, ret)
+    | "%" -> move (r, eax)  <+> move (L (0), edx) <+ Sar1 (l) <+ Sar1 (eax) <+ Cltd <+ IDiv (l) <+> toFixedNum (edx) <+> move (edx, ret)
+    | cmp -> move(l, eax) <+ Binop("cmp", eax, r) <+ Mov(L(0), eax) <+ Set(suffix(cmp), "%al") <+> toFixedNum(eax) <+ Mov(eax, ret)
+    | "&&" -> cmpLogical(name, l, r, ret)
+    | "!!" -> cmpLogical(name, l, r, ret)
+  esac
+}
+
+fun toBit(opnd) {
+  Sar1(opnd).singletonBuffer <+ Binop("cmp", L(0), opnd) <+ Mov(L(0), eax) <+ Set(suffix("!="), "%al") <+ Mov(eax, opnd)
+}
+
+fun cmpLogical(x86Name, l, r, ret) {
+  toBit(l) <+> toBit(r) <+ Mov(r, eax) <+ Binop(x86Name, l, eax) <+> toFixedNum(eax) <+ Mov(eax, ret)
+}
+
+fun saveRegs(regs) {
+  case regs of 
+    r:regs -> 
+      case saveRegs (regs) of [pushRegsOnStack, popRegsFromStack] -> 
+        [singletonBuffer(Push (r)) <+> pushRegsOnStack, popRegsFromStack <+ Pop (r)]
+      esac 
+  | {} -> [emptyBuffer(), emptyBuffer()]
+  esac
+}
+
+fun loadArgs (env, n) {
+  case n of
+    0 -> [env, emptyBuffer()]
+  | n -> 
+      case pop(env) of [s, env] -> 
+        case loadArgs (env, n - 1) of 
+          [env, loadArgs] -> [env, singletonBuffer(Push (s)) <+> loadArgs]
+        esac
+      esac 
+  esac
+}
+
+fun call (env, fLabel, nA) {
+  case foldl(fun ([pushs, pops], r) { [pushs <+ Push (r), singletonBuffer (Pop (r)) <+> pops] }, 
+              [{}, {}], liveRegisters (env, nA)
+       ) of
+    [pushRegs, popRegs] ->
+      fun pushArgs (env, acc, n) {
+        case n of
+          0 -> [env, acc]
+        | n -> case env.pop of
+                [x, env] -> pushArgs (env, acc <+ Push (x), n - 1)
+              esac
+        esac
+      }
+
+      case pushArgs (env, emptyBuffer (), nA) of
+        [env, pushArgs] ->
+          case env.allocate of
+            [y, env] ->
+              [env, pushRegs <+>
+                    pushArgs <+
+                    Call (fLabel) <+
+                    Binop ("+", L (wordSize * nA), esp) <+>
+                    popRegs <+
+                    Mov (eax, y)
+              ]
+          esac
+      esac
+  esac
 }
 
 -- A top-level codegeneration function. Takes a driver's environment and a stack machine program,
